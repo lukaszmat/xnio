@@ -23,6 +23,8 @@ import static org.xnio._private.Messages.msg;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.Collections;
@@ -41,6 +43,7 @@ import org.xnio.IoFuture;
 import org.xnio.OptionMap;
 import org.xnio.Pooled;
 import org.xnio.StreamConnection;
+import org.xnio.RelayingPriorityStreamConnectionChannelListener;
 import org.xnio.XnioWorker;
 import org.xnio.channels.BoundChannel;
 import org.xnio.ssl.SslConnection;
@@ -177,6 +180,7 @@ public class HttpUpgrade {
         private final FutureResult<T> future = new FutureResult<T>();
         private T connection;
 
+      private boolean proxyUsed = false;
 
         private HttpUpgradeState(final XnioWorker worker, final XnioSsl ssl, final InetSocketAddress bindAddress, final URI uri, final Map<String, String> headers, final ChannelListener<? super T> openListener, final ChannelListener<? super BoundChannel> bindListener, final OptionMap optionMap, final HandshakeChecker handshakeChecker) {
             this.worker = worker;
@@ -192,6 +196,8 @@ public class HttpUpgrade {
                 newHeaders.put(entry.getKey(), Collections.singletonList(entry.getValue()));
             }
             this.headers = newHeaders;
+            
+            this.checkIsProxyUsed();
         }
 
         private HttpUpgradeState(final XnioWorker worker, final XnioSsl ssl, final InetSocketAddress bindAddress, final URI uri, final Map<String, List<String>> headers, final ChannelListener<? super T> openListener, final ChannelListener<? super BoundChannel> bindListener, final OptionMap optionMap, final ExtendedHandshakeChecker handshakeChecker) {
@@ -204,6 +210,8 @@ public class HttpUpgrade {
             this.bindListener = bindListener;
             this.optionMap = optionMap;
             this.handshakeChecker = handshakeChecker;
+            
+            this.checkIsProxyUsed();
         }
 
         public HttpUpgradeState(final T connection, final URI uri, final Map<String, String> headers, final ChannelListener<? super StreamConnection> openListener, final HandshakeChecker handshakeChecker) {
@@ -221,6 +229,8 @@ public class HttpUpgrade {
                 newHeaders.put(entry.getKey(), Collections.singletonList(entry.getValue()));
             }
             this.headers = newHeaders;
+
+         this.checkIsProxyUsed();
         }
 
         public HttpUpgradeState(final T connection, final URI uri, final Map<String, List<String>> headers, final ChannelListener<? super StreamConnection> openListener, final ExtendedHandshakeChecker handshakeChecker) {
@@ -234,13 +244,47 @@ public class HttpUpgrade {
             this.optionMap = OptionMap.EMPTY;
             this.handshakeChecker = handshakeChecker;
             this.connection = connection;
+
+            this.checkIsProxyUsed();
         }
 
+        private void checkIsProxyUsed() {
+           Proxy proxy = (Proxy) ProxySelector.getDefault().select(uri).iterator().next();
+           if (proxy != Proxy.NO_PROXY) {
+              this.proxyUsed = true;
+           }
+        }
+        
+        private InetSocketAddress getDestinationAddress() {
+           Proxy proxy = (Proxy) ProxySelector.getDefault().select(uri).iterator().next();
 
+           InetSocketAddress address;
+           if (proxy == Proxy.NO_PROXY) {
+              address = new InetSocketAddress(uri.getHost(), uri.getPort());
+           } else {
+              address = (InetSocketAddress) proxy.address();
+           }
+
+           if (address.isUnresolved()) {
+              address = new InetSocketAddress( address.getHostName(), address.getPort() );
+           }
+
+           return address;
+        }
+        
         private IoFuture<T> doUpgrade() {
-            InetSocketAddress address = new InetSocketAddress(uri.getHost(), uri.getPort());
+            InetSocketAddress address = getDestinationAddress();
+            if (address.isUnresolved()) {
+               address = new InetSocketAddress( address.getHostName(), address.getPort() );
+            }
 
-            final ChannelListener<StreamConnection> connectListener = new ConnectionOpenListener();
+            ChannelListener<StreamConnection> connectListener = null;
+            if (proxyUsed) {
+               connectListener = new ProxyConnectListener( new ConnectionOpenListener() );
+            } else {
+               connectListener = new ConnectionOpenListener();
+            }
+
             final String scheme = uri.getScheme();
             if (scheme.equals("http")) {
                 if (bindAddress == null) {
@@ -311,13 +355,17 @@ public class HttpUpgrade {
         }
 
         public IoFuture<T> upgradeExistingConnection() {
-            final ChannelListener<StreamConnection> connectListener = new ConnectionOpenListener();
-            connectListener.handleEvent(connection);
+         if (proxyUsed) {
+            new ProxyConnectListener( new ConnectionOpenListener() ).handleEvent(connection);
+         } else {
+            new ConnectionOpenListener().handleEvent(connection);
+         }
             return future.getIoFuture();
         }
 
 
         private class ConnectionOpenListener implements ChannelListener<StreamConnection> {
+         @SuppressWarnings( "unchecked" )
             @Override
             public void handleEvent(final StreamConnection channel) {
                 connection = (T) channel;
@@ -524,5 +572,190 @@ public class HttpUpgrade {
                 future.setCancelled();
             }
         }
-    }
+      
+      private String buildConnectRequest() {
+         final StringBuilder builder = new StringBuilder();
+         builder.append("CONNECT ");
+         builder.append( uri.getHost() + ":" + uri.getPort() );
+         builder.append(" HTTP/1.1\r\n");
+
+         builder.append("Host: ");
+         builder.append( uri.getHost() + ":" + uri.getPort() );
+         builder.append("\r\n");
+
+         builder.append("Proxy-Connection: keep-alive\r\n");
+         builder.append("\r\n");
+         return builder.toString();
+      }
+
+      private void handleProxy(final HttpUpgradeParser parser, final ChannelListener<? super StreamConnection> connectListener) {
+         Map<String, String> simpleHeaders = new HashMap<>();
+         for(Map.Entry<String, List<String>> e : parser.getHeaders().entrySet()) {
+            simpleHeaders.put(e.getKey(), e.getValue().get(0));
+         }
+         final String contentLength = simpleHeaders.get("content-length");
+         if (contentLength != null) {
+            if (!"0".equals(contentLength)) {
+               future.setException(new IOException("Upgrade responses must have a content length of zero."));
+               return;
+            }
+         }
+         final String transferCoding = simpleHeaders.get("transfer-encoding");
+         if (transferCoding != null) {
+            future.setException(new IOException("Upgrade responses cannot have a transfer coding"));
+            return;
+         }
+
+         future.setResult(connection);
+         ChannelListeners.invokeChannelListener(connection, connectListener);
+      }
+      
+      /**
+       * Connect listener that opens a tunnel (HTTP CONNECT) in the current proxy server.
+       */
+      private class ProxyConnectListener implements RelayingPriorityStreamConnectionChannelListener {
+         
+         private ChannelListener<StreamConnection> connectListener;
+
+         public ProxyConnectListener( ChannelListener<StreamConnection> wrappedListener )
+         {
+            this.connectListener = wrappedListener;
+         }
+         
+         @SuppressWarnings( "unchecked" )
+         @Override
+         public void handleEvent(final StreamConnection channel) {
+            connection = (T) channel;
+            final ByteBuffer buffer = ByteBuffer.wrap(buildConnectRequest().getBytes());
+            int r;
+            do {
+               try {
+                  r = channel.getSinkChannel().write(buffer);
+               } catch (IOException e) {
+                  safeClose(channel);
+                  future.setException(e);
+                  return;
+               }
+            } while (buffer.hasRemaining() && r >= 0);
+            connection.getSinkChannel().suspendWrites();
+
+            try {
+               connection.getSinkChannel().flush();
+               connection.getSinkChannel().getWriteSetter().set(ChannelListeners.flushingChannelListener(new ChannelListener<StreamSinkChannel>() {
+                  @Override
+                  public void handleEvent(StreamSinkChannel channel) {
+                     new ConnectionOpenListener().handleEvent(connection);
+                  }
+               }, new ChannelExceptionHandler<StreamSinkChannel>() {
+                  @Override
+                  public void handleException(StreamSinkChannel channel, IOException exception) {
+                     safeClose(channel);
+                     future.setException(exception);
+                  }
+               }));
+               connection.getSourceChannel().getReadSetter().set( new ProxyConnectResultListener(connectListener));
+               connection.getSourceChannel().resumeReads();
+            } catch (IOException e) {
+               safeClose(connection);
+               future.setException(e);
+               return;
+            }
+         }
+
+         @Override
+         public void setWrappedChannelListener( ChannelListener<StreamConnection> wrappedListener ) {
+            this.connectListener = wrappedListener;
+         }
+
+         @Override
+         public ChannelListener<StreamConnection> getWrappedChannelListener( ) {
+            return this.connectListener;
+         }
+      }
+
+      /**
+       * Result listener that handles the proxy connect result.
+       */
+      private final class ProxyConnectResultListener implements ChannelListener<StreamSourceChannel> {
+
+         private final HttpUpgradeParser parser = new HttpUpgradeParser();
+         private ByteBuffer buffer = ByteBuffer.allocate(1024);
+         private final ChannelListener<? super StreamConnection> connectListener;
+         
+         public ProxyConnectResultListener( final ChannelListener<? super StreamConnection> connectListener )
+         {
+            this.connectListener = connectListener;
+         }
+
+         @Override
+         public void handleEvent(final StreamSourceChannel channel) {
+            int r;
+            do {
+               try {
+                  r = channel.read(buffer);
+                  if (r == 0) {
+                     channel.getReadSetter().set(this);
+                     channel.resumeReads();
+                     return;
+                  } else if (r == -1) {
+                     throw msg.connectionClosedEarly();
+                  }
+                  buffer.flip();
+                  parser.parse(buffer);
+                  if(!parser.isComplete()) {
+                     buffer.compact();
+                  }
+               } catch (IOException e) {
+                  safeClose(channel);
+                  future.setException(e);
+                  return;
+               }
+
+            } while (!parser.isComplete());
+            channel.suspendReads();
+
+            if (buffer.hasRemaining()) {
+               StreamSourceConduit orig = connection.getSourceChannel().getConduit();
+               PushBackStreamSourceConduit pushBack = new PushBackStreamSourceConduit(orig);
+               pushBack.pushBack(new Pooled<ByteBuffer>() {
+                  @Override
+                  public void discard() {
+                     buffer = null;
+                  }
+
+                  @Override
+                  public void free() {
+                     buffer = null;
+                  }
+
+                  @Override
+                  public ByteBuffer getResource() throws IllegalStateException {
+                     return buffer;
+                  }
+
+                  @Override
+                  public void close() {
+                     free();
+                  }
+               });
+               connection.getSourceChannel().setConduit(pushBack);
+            }
+
+            // ok, we have a response
+            if (parser.getResponseCode() == 200) { // OK
+               handleProxy(parser, connectListener);
+            } else if (parser.getResponseCode() == 301 || // Moved Permanently
+                  parser.getResponseCode() == 302 || // Found
+                  parser.getResponseCode() == 303 || // See Other
+                  parser.getResponseCode() == 307 || // Temporary Redirect
+                  parser.getResponseCode() == 308) { // Permanent Redirect
+               safeClose(connection);
+               handleRedirect(parser);
+            } else {
+               safeClose(connection);
+               future.setException(new ProxyConnectFailedException("Invalid response code " + parser.getResponseCode()));
+            }
+         }
+      }
+   }
 }

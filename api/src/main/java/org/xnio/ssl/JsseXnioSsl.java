@@ -46,6 +46,7 @@ import org.xnio.Option;
 import org.xnio.OptionMap;
 import org.xnio.Options;
 import org.xnio.Pool;
+import org.xnio.RelayingPriorityStreamConnectionChannelListener;
 import org.xnio.StreamConnection;
 import org.xnio.Xnio;
 import org.xnio.XnioExecutor;
@@ -123,15 +124,15 @@ public final class JsseXnioSsl extends XnioSsl {
     public IoFuture<ConnectedSslStreamChannel> connectSsl(final XnioWorker worker, final InetSocketAddress bindAddress, final InetSocketAddress destination, final ChannelListener<? super ConnectedSslStreamChannel> openListener, final ChannelListener<? super BoundChannel> bindListener, final OptionMap optionMap) {
         final FutureResult<ConnectedSslStreamChannel> futureResult = new FutureResult<ConnectedSslStreamChannel>(IoUtils.directExecutor());
         final IoFuture<SslConnection> futureSslConnection = openSslConnection(worker, bindAddress, destination, new ChannelListener<SslConnection>() {
-                    public void handleEvent(final SslConnection sslConnection) {
-                        final ConnectedSslStreamChannel assembledChannel = new AssembledConnectedSslStreamChannel(sslConnection, sslConnection.getSourceChannel(), sslConnection.getSinkChannel());
-                        if (!futureResult.setResult(assembledChannel)) {
-                            safeClose(assembledChannel);
-                        } else {
-                            ChannelListeners.invokeChannelListener(assembledChannel, openListener);
-                        }
+            public void handleEvent(final SslConnection sslConnection) {
+                final ConnectedSslStreamChannel assembledChannel = new AssembledConnectedSslStreamChannel(sslConnection, sslConnection.getSourceChannel(), sslConnection.getSinkChannel());
+                    if (!futureResult.setResult(assembledChannel)) {
+                        safeClose(assembledChannel);
+                    } else {
+                        ChannelListeners.invokeChannelListener(assembledChannel, openListener);
                     }
-                }, bindListener, optionMap).addNotifier(new IoFuture.HandlingNotifier<SslConnection, FutureResult<ConnectedSslStreamChannel>>() {
+                }
+            }, bindListener, optionMap).addNotifier(new IoFuture.HandlingNotifier<SslConnection, FutureResult<ConnectedSslStreamChannel>>() {
             public void handleCancelled(final FutureResult<ConnectedSslStreamChannel> result) {
                 result.setCancelled();
             }
@@ -154,34 +155,8 @@ public final class JsseXnioSsl extends XnioSsl {
     }
 
     public IoFuture<SslConnection> openSslConnection(final XnioIoThread ioThread, final InetSocketAddress bindAddress, final InetSocketAddress destination, final ChannelListener<? super SslConnection> openListener, final ChannelListener<? super BoundChannel> bindListener, final OptionMap optionMap) {
-        final FutureResult<SslConnection> futureResult = new FutureResult<>(ioThread);
-        final IoFuture<StreamConnection> connection = ioThread.openStreamConnection(bindAddress, destination, new ChannelListener<StreamConnection>() {
-            public void handleEvent(final StreamConnection connection) {
-                final SSLEngine sslEngine = JsseSslUtils.createSSLEngine(sslContext, optionMap, destination);
-                final boolean startTls = optionMap.get(Options.SSL_STARTTLS, false);
-                final SslConnection wrappedConnection;
-                try {
-                    wrappedConnection = NEW_IMPL ? new JsseSslConnection(connection, sslEngine, bufferPool, bufferPool) : new JsseSslStreamConnection(connection, sslEngine, bufferPool, bufferPool, startTls);
-                } catch (RuntimeException e) {
-                    futureResult.setCancelled();
-                    throw e;
-                }
-                if (NEW_IMPL && ! startTls) {
-                    try {
-                        wrappedConnection.startHandshake();
-                    } catch (IOException e) {
-                        if (futureResult.setException(e)) {
-                            IoUtils.safeClose(connection);
-                        }
-                    }
-                }
-                if (! futureResult.setResult(wrappedConnection)) {
-                    IoUtils.safeClose(connection);
-                } else {
-                    ChannelListeners.invokeChannelListener(wrappedConnection, openListener);
-                }
-            }
-        }, bindListener, optionMap);
+        final FutureResult<SslConnection> futureResult = new FutureResult<SslConnection>(ioThread);
+        final IoFuture<StreamConnection> connection = ioThread.openStreamConnection(bindAddress, destination, createStreamConnectionChannelListener( optionMap, destination, futureResult, openListener ), bindListener, optionMap);
         connection.addNotifier(new IoFuture.HandlingNotifier<StreamConnection, FutureResult<SslConnection>>() {
             public void handleCancelled(final FutureResult<SslConnection> attachment) {
                 attachment.setCancelled();
@@ -193,6 +168,34 @@ public final class JsseXnioSsl extends XnioSsl {
         }, futureResult);
         futureResult.addCancelHandler(connection);
         return futureResult.getIoFuture();
+    }
+
+    /**
+     * Create the {@link StreamConnectionChannelListener} used to establish the SSL connection.
+     * Respect the {@link RelayingPriorityStreamConnectionChannelListener} if the given <code>openListener</code>
+     * is one.
+     *
+     * @param optionMap       the options use
+     * @param destination     the destination address
+     * @param futureResult    the result connection wrapper
+     * @param openListener    the open listener
+     * @return                a stream connection channel listener
+     */
+    private ChannelListener<? super StreamConnection> createStreamConnectionChannelListener(OptionMap optionMap, InetSocketAddress destination, FutureResult<SslConnection> futureResult, ChannelListener<? super SslConnection> openListener)
+    {
+       ChannelListener<? super StreamConnection> result;
+
+       if( openListener instanceof RelayingPriorityStreamConnectionChannelListener ) {
+          // there is a priority channel listener -> install our listener inside
+          RelayingPriorityStreamConnectionChannelListener wrappingListener = ( RelayingPriorityStreamConnectionChannelListener ) openListener;
+          StreamConnectionChannelListener streamConnectListener = new StreamConnectionChannelListener( optionMap, destination, futureResult, wrappingListener.getWrappedChannelListener() );
+          wrappingListener.setWrappedChannelListener( streamConnectListener );
+          result = (ChannelListener<? super StreamConnection>) wrappingListener;
+       } else {
+          result = new StreamConnectionChannelListener( optionMap, destination, futureResult, openListener );
+       }
+
+       return result;
     }
 
     @SuppressWarnings("deprecation")
@@ -286,4 +289,44 @@ public final class JsseXnioSsl extends XnioSsl {
         if (acceptListener != null) server.getAcceptSetter().set(acceptListener);
         return server;
     }
+
+    private class StreamConnectionChannelListener implements ChannelListener<StreamConnection> {
+       private final OptionMap optionMap;
+       private final InetSocketAddress destination;
+       private final FutureResult<SslConnection> futureResult;
+       private final ChannelListener<? super SslConnection> openListener;
+
+       public StreamConnectionChannelListener(OptionMap optionMap, InetSocketAddress destination, FutureResult<SslConnection> futureResult, ChannelListener<? super SslConnection> openListener) {
+           this.optionMap = optionMap;
+           this.destination = destination;
+           this.futureResult = futureResult;
+           this.openListener = openListener;
+       }
+
+       public void handleEvent(final StreamConnection connection) {
+           final SSLEngine sslEngine = JsseSslUtils.createSSLEngine(sslContext, optionMap, destination);
+           final boolean startTls = optionMap.get(Options.SSL_STARTTLS, false);
+           final SslConnection wrappedConnection;
+           try {
+               wrappedConnection = NEW_IMPL ? new JsseSslConnection(connection, sslEngine, bufferPool, bufferPool) : new JsseSslStreamConnection(connection, sslEngine, bufferPool, bufferPool, startTls);
+           } catch (RuntimeException e) {
+               futureResult.setCancelled();
+               throw e;
+           }
+           if (NEW_IMPL && ! startTls) {
+               try {
+                   wrappedConnection.startHandshake();
+               } catch (IOException e) {
+                   if (futureResult.setException(e)) {
+                       IoUtils.safeClose(connection);
+                   }
+               }
+           }
+           if (! futureResult.setResult(wrappedConnection)) {
+               IoUtils.safeClose(connection);
+           } else {
+               ChannelListeners.invokeChannelListener(wrappedConnection, this.openListener);
+           }
+       }
+   }
 }
